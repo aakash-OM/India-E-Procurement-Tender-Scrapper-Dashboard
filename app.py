@@ -2,6 +2,7 @@
 Gov Tender Dashboard – Flask backend
 """
 import json
+import os
 import threading
 import io
 from datetime import datetime
@@ -251,5 +252,7 @@ def get_jobs():
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("\n  Gov Tender Dashboard  ->  http://localhost:5000\n")
-    app.run(debug=True, port=5000, use_reloader=False)
+    port = int(os.environ.get("PORT", 5000))
+    debug = not os.environ.get("RAILWAY_ENVIRONMENT")  # debug off on Railway
+    print(f"\n  Gov Tender Dashboard  ->  http://localhost:{port}\n")
+    app.run(debug=debug, host="0.0.0.0", port=port, use_reloader=False)

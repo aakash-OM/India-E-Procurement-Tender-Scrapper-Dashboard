@@ -268,8 +268,8 @@
             <div class="form-group">
               <label class="form-label">Browser Mode</label>
               <select id="headless-mode" class="form-select">
-                <option value="true">Headless (background)</option>
-                <option value="false">Visible browser</option>
+                <option value="false" selected>Visible browser (watch it scrape)</option>
+                <option value="true">Headless (background, no window)</option>
               </select>
             </div>
 
@@ -316,16 +316,26 @@
           </button>
 
           <!-- Progress -->
-          <div class="progress-block" id="progress-block">
-            <div style="margin-top:16px;"></div>
+          <div class="progress-block visible" id="progress-block">
+            <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,0.06);padding-top:16px;"></div>
+            <div style="font-size:11px;color:var(--text3);margin-bottom:10px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <i class="fa-solid fa-circle-info" style="color:var(--cyan)"></i>
+              GeM fetch source:
+              <a href="https://bidplus.gem.gov.in/all-bids" target="_blank" rel="noopener"
+                 style="color:var(--cyan);font-weight:600;text-decoration:none;">
+                bidplus.gem.gov.in/all-bids
+                <i class="fa-solid fa-arrow-up-right-from-square" style="font-size:9px;margin-left:3px;"></i>
+              </a>
+              &nbsp;·&nbsp; types into <code style="background:rgba(0,212,255,0.1);padding:1px 5px;border-radius:3px;font-size:10px;">#searchBid</code> input, clicks page-by-page
+            </div>
             <div class="progress-info">
-              <span id="prog-text" style="font-size:11px;color:var(--cyan);">Initializing...</span>
+              <span id="prog-text" style="font-size:11px;color:var(--cyan);">Ready — press START SEARCH to open the GeM browser and begin scraping</span>
               <span id="prog-pct" style="font-size:11px;color:var(--text3);"></span>
             </div>
             <div class="progress-track">
               <div class="progress-fill" id="prog-fill" style="width:0%"></div>
             </div>
-            <div style="font-size:11px;color:var(--text3);margin-bottom:6px;">PDF Processing</div>
+            <div style="font-size:11px;color:var(--text3);margin-bottom:6px;margin-top:8px;">PDF Processing</div>
             <div class="progress-track">
               <div class="progress-fill" id="prog-pdf" style="width:0%;background:linear-gradient(90deg,var(--purple),var(--pink))"></div>
             </div>

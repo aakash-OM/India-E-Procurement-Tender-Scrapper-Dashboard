@@ -238,8 +238,18 @@ function renderPortals(catFilter) {
       </div>
       <div class="portal-name">${escHtml(p.name)}</div>
       <div class="portal-fullname">${escHtml(p.full_name || p.state || '')}</div>
-      <div class="portal-check">
-        ${state.selectedPortals.has(p.id) ? '<i class="fa-solid fa-check"></i>' : ''}
+      ${p.description ? `<div style="font-size:10px;color:var(--text3);margin-top:4px;line-height:1.4;">${escHtml(p.description)}</div>` : ''}
+      <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;">
+        <div class="portal-check">
+          ${state.selectedPortals.has(p.id) ? '<i class="fa-solid fa-check"></i>' : ''}
+        </div>
+        ${p.url ? `
+          <a href="${escHtml(p.url)}" target="_blank" rel="noopener"
+             onclick="event.stopPropagation()"
+             style="font-size:10px;color:${p.color};opacity:.8;text-decoration:none;display:flex;align-items:center;gap:3px;"
+             title="Open ${escHtml(p.name)} portal">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Visit
+          </a>` : ''}
       </div>
     </div>
   `).join('') || `<div class="empty-state" style="grid-column:1/-1"><i class="fa-solid fa-globe"></i><p>No portals in this category.</p></div>`;
@@ -274,13 +284,16 @@ function renderSearchPortalChips() {
     if (!p) return '';
     const live = p.implemented;
     return `
-      <span style="display:inline-flex;align-items:center;gap:5px;padding:5px 12px;
-                   border-radius:12px;font-size:11px;font-weight:600;cursor:default;
+      <span style="display:inline-flex;align-items:center;gap:6px;padding:5px 12px;
+                   border-radius:12px;font-size:11px;font-weight:600;
                    background:${live ? 'rgba(0,212,255,0.15)' : 'rgba(255,107,53,0.1)'};
                    border:1px solid ${live ? 'rgba(0,212,255,0.3)' : 'rgba(255,107,53,0.2)'};
                    color:${live ? 'var(--cyan)' : 'var(--orange)'};">
         <i class="fa-solid ${live ? 'fa-check' : 'fa-clock'}"></i>
         ${escHtml(p.name)}${live ? '' : ' <span style="font-weight:400;opacity:.7">(soon)</span>'}
+        ${live && p.search_url ? `<a href="${escHtml(p.search_url)}" target="_blank" rel="noopener"
+            style="color:inherit;opacity:.7;margin-left:2px;" title="Open ${escHtml(p.name)} bid listing">
+            <i class="fa-solid fa-arrow-up-right-from-square" style="font-size:9px;"></i></a>` : ''}
       </span>`;
   }).join('');
 }
@@ -504,7 +517,7 @@ window.startSearch = async () => {
   const portals = [...state.selectedPortals];
   const kwIds   = [...state.selectedKeywords];
   const maxPages = parseInt(document.getElementById('max-pages')?.value || 5);
-  const headless = document.getElementById('headless-mode')?.checked !== false;
+  const headless = document.getElementById('headless-mode')?.value === 'true';
 
   const btn = document.getElementById('btn-search');
   btn.disabled = true;
@@ -578,6 +591,8 @@ async function pollStatus() {
     clearInterval(state.polling);
     state.polling = null;
     updateScrapeUI(false);
+    const progText = document.getElementById('prog-text');
+    if (progText) progText.textContent = 'Ready — press START SEARCH to begin fetching from GeM';
     if (data.bids_found > 0) showToast(`Done! ${data.bids_found} new bids saved.`, 'success');
     loadStats();
     loadResults();
