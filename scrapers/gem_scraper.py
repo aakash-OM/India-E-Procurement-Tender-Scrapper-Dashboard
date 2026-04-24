@@ -1,22 +1,20 @@
 """
-GeM Portal Scraper – dashboard integration layer.
-Logic ported from gem_bid_scraper_fast.py (v8).
-Progress is reported via the shared `status` dict instead of console prints.
+GeM Portal Scraper — dashboard integration.
+Direct port of gem_bid_scraper_fast.py:
+  - Same browser setup, same search flow, same card parser, same PDF parser
+  - Only changes: print() -> status["log"] and Excel save -> db.add_bid()
 """
 
 import os
-import time
-import re
 import io
+import re
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# On Railway (or any server without a display), headless is always forced.
-_ON_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
-
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -28,11 +26,29 @@ try:
 except ImportError:
     from PyPDF2 import PdfReader
 
+# ── Constants (same as gem_bid_scraper_fast.py) ────────────────────────────────
+
 GEM_BASE             = "https://bidplus.gem.gov.in"
 AJAX_WAIT            = 7
 PAGE_NAV_WAIT        = 5
 PDF_TIMEOUT          = 20
 PARALLEL_PDF_WORKERS = 10
+
+# Force headless on Railway (no display)
+_ON_SERVER = bool(
+    os.environ.get("RAILWAY_ENVIRONMENT") or
+    os.environ.get("RAILWAY_PROJECT_ID")
+)
+
+TARGET_ORGANISATIONS = [
+    "BHEL", "Bharat Heavy Electricals", "NTPC", "National Thermal Power",
+    "NHPC", "NHAI", "Uttar Pradesh Power Corporation", "PGCIL",
+    "Power Grid Corporation", "UPPCL", "PSPCL", "PSTCL", "KPCL", "KPTCL",
+    "MSEDCL", "MAHATRANSCO", "MAHAGENCO", "GUVNL", "GETCO",
+    "WBSEDCL", "WBSETCL", "JBVNL", "CSPGCL", "CSPDCL",
+    "Railways", "Indian Railways", "Power Department", "Energy Department",
+    "Electricity Board", "Vidyut", "Transco", "Genco", "DISCOM",
+]
 
 CARD_SECTOR_KEYWORDS = [
     "Power", "Energy", "Electric", "Vidyut", "Bijli",
@@ -63,32 +79,32 @@ STATE_REGION_MAP = {
     "Karnataka": "South",        "Telangana": "South",     "Andhra Pradesh": "South",
     "Tamil Nadu": "South",       "Kerala": "South",
     "West Bengal": "East",       "Odisha": "East",         "Bihar": "East",
-    "Jharkhand": "East",         "Madhya Pradesh": "Central", "Chhattisgarh": "Central",
+    "Jharkhand": "East",
+    "Madhya Pradesh": "Central", "Chhattisgarh": "Central",
     "Assam": "Northeast",        "Manipur": "Northeast",   "Meghalaya": "Northeast",
     "Mizoram": "Northeast",      "Nagaland": "Northeast",  "Tripura": "Northeast",
     "Arunachal Pradesh": "Northeast", "Sikkim": "Northeast",
 }
 
 
-# ── Browser ────────────────────────────────────────────────────────────────────
+# ── Browser (same as gem_bid_scraper_fast.py) ──────────────────────────────────
 
-def _make_driver(headless=True):
-    opts = Options()
-    if headless or _ON_RAILWAY:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument(
+def _make_driver(headless=False):
+    o = Options()
+    if headless or _ON_SERVER:
+        o.add_argument("--headless=new")
+    o.add_argument("--no-sandbox")
+    o.add_argument("--disable-dev-shm-usage")
+    o.add_argument("--disable-gpu")
+    o.add_argument("--window-size=1920,1080")
+    o.add_argument("--disable-blink-features=AutomationControlled")
+    o.add_experimental_option("excludeSwitches", ["enable-automation"])
+    o.add_experimental_option("useAutomationExtension", False)
+    o.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     )
-    svc = ChromeService(ChromeDriverManager().install())
-    drv = webdriver.Chrome(service=svc, options=opts)
+    drv = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=o)
     drv.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
@@ -96,12 +112,93 @@ def _make_driver(headless=True):
     return drv
 
 
-# ── Card field extraction from plain text ──────────────────────────────────────
+# ── Filters (same as gem_bid_scraper_fast.py) ──────────────────────────────────
 
-def _extract_card_fields_from_text(text):
-    """Parse dept/state/dates from a bid card's plain text (works on both
-    Selenium .text and BeautifulSoup get_text output)."""
+def _is_target_org(org_text, target_orgs):
+    if not target_orgs:
+        return True
+    if not org_text or org_text == "N/A":
+        return False
+    org_upper = org_text.upper()
+    return any(t.upper() in org_upper for t in target_orgs)
+
+
+def _is_blocked_category(item_category):
+    if not item_category or item_category == "N/A":
+        return False
+    cat_upper = item_category.upper()
+    return any(kw.upper() in cat_upper for kw in BLOCKED_KEYWORDS)
+
+
+def _card_prefilter(bid, target_orgs):
+    if not target_orgs:
+        return True
+    state = str(bid.get("State / Ministry", "") or "").upper()
+    dept  = str(bid.get("Department",       "") or "").upper()
+    combined = state + " " + dept
+    for t in target_orgs:
+        if t.upper() in combined:
+            return True
+    for kw in CARD_SECTOR_KEYWORDS:
+        if kw.upper() in combined:
+            return True
+    return False
+
+
+# ── Card parsing (exact copy from gem_bid_scraper_fast.py) ────────────────────
+
+def _parse_bid_cards(soup, keyword):
+    results   = []
+    container = soup.find("div", id="bidCard")
+    if not container:
+        return results
+    for card in (container.find_all("div", class_="card") or []):
+        bid = _parse_single_card(card, keyword)
+        if bid:
+            results.append(bid)
+    return results
+
+
+def _parse_single_card(card, keyword):
+    try:
+        bid_link = card.find("a", class_="bid_no_hover")
+        if not bid_link:
+            return None
+        bid_no = bid_link.get_text(strip=True)
+        if not re.search(r"GEM/\d{4}/", bid_no, re.I):
+            return None
+
+        href = bid_link.get("href", "")
+        if href.startswith("/"):
+            bid_url = GEM_BASE + href
+        elif href.startswith("http"):
+            bid_url = href
+        else:
+            bid_url = GEM_BASE + "/" + href.lstrip("/")
+
+        f = _extract_card_fields(card)
+        from datetime import datetime
+        return {
+            "Bid Number":          bid_no,
+            "Organisation Name":   "N/A",
+            "Department":          f.get("dept",       "N/A"),
+            "State / Ministry":    f.get("state",      "N/A"),
+            "Item Category":       "N/A",
+            "Quantity":            f.get("quantity",   "N/A"),
+            "Estimated Value (Rs)": "N/A",
+            "Bid Start Date":      f.get("start_date", "N/A"),
+            "Bid End Date":        f.get("end_date",   "N/A"),
+            "Keyword Used":        keyword,
+            "Bid URL":             bid_url,
+            "Scraped On":          datetime.now().strftime("%d-%m-%Y %H:%M"),
+        }
+    except Exception:
+        return None
+
+
+def _extract_card_fields(card):
     result = {}
+    text   = card.get_text(separator=" ", strip=True)
 
     m = re.match(r'^([\d,\.]+)\s+Department Name And Address:', text, re.I)
     if m:
@@ -115,11 +212,11 @@ def _extract_card_fields_from_text(text):
         if dept:
             result["dept"] = dept
 
-    m = re.search(r'Start Date:\s*(\d{2}-\d{2}-\d{4}[^E]{0,25}?)(?:\s+End|\s*$)', text, re.I)
+    m = re.search(r'Start Date:\s*(\d{2}-\d{2}-\d{4}\s+\d+:\d+\s+(?:AM|PM))', text, re.I)
     if m:
         result["start_date"] = m.group(1).strip()
 
-    m = re.search(r'End Date:\s*(\d{2}-\d{2}-\d{4}(?:\s+\d+:\d+\s+(?:AM|PM))?)', text, re.I)
+    m = re.search(r'End Date:\s*(\d{2}-\d{2}-\d{4}\s+\d+:\d+\s+(?:AM|PM))', text, re.I)
     if m:
         result["end_date"] = m.group(1).strip()
 
@@ -148,99 +245,7 @@ def _split_ministry_dept(dept_block):
     return (dept_block, None)
 
 
-def _build_card(bid_no, bid_url, card_text, keyword):
-    f = _extract_card_fields_from_text(card_text)
-    return {
-        "bid_number":    bid_no,
-        "bid_url":       bid_url,
-        "department":    f.get("dept",       ""),
-        "state_text":    f.get("state",      ""),
-        "item_category": "",
-        "quantity":      f.get("quantity",   ""),
-        "keyword_used":  keyword,
-        "start_date":    f.get("start_date", ""),
-        "end_date":      f.get("end_date",   ""),
-    }
-
-
-def _make_bid_url(href):
-    if href.startswith("http"):
-        return href
-    return GEM_BASE + ("/" if not href.startswith("/") else "") + href.lstrip("/")
-
-
-# ── Card extraction – Selenium (primary) ──────────────────────────────────────
-
-def _extract_cards_selenium(driver, keyword, status):
-    """
-    Uses the live Selenium DOM to pull bid cards.
-    More reliable than BeautifulSoup on page_source because we already know
-    a.bid_no_hover elements exist (WebDriverWait confirmed it).
-    """
-    cards = []
-    bid_links = driver.find_elements(By.CSS_SELECTOR, "a.bid_no_hover")
-    status["log"].append(f"[GeM] Selenium DOM: {len(bid_links)} bid links found")
-
-    for link in bid_links:
-        try:
-            bid_no = link.text.strip()
-            if not re.search(r"GEM/\d{4}/", bid_no, re.I):
-                continue
-            bid_url = _make_bid_url(link.get_attribute("href") or "")
-
-            # Try to get the enclosing card's text (walks up to div.card or similar)
-            card_text = ""
-            try:
-                ancestor = link.find_element(
-                    By.XPATH,
-                    "ancestor::div[contains(@class,'card') or contains(@class,'bid_no')][1]"
-                )
-                card_text = ancestor.text
-            except Exception:
-                try:
-                    card_text = link.find_element(By.XPATH, "../..").text
-                except Exception:
-                    card_text = bid_no
-
-            cards.append(_build_card(bid_no, bid_url, card_text, keyword))
-        except Exception:
-            continue
-    return cards
-
-
-# ── Card extraction – BeautifulSoup (fallback) ────────────────────────────────
-
-def _extract_cards_bs4(driver, keyword, status):
-    """
-    Fallback: parse driver.page_source with BeautifulSoup.
-    Searches the whole page for a.bid_no_hover so it works even if the
-    container div id/class has changed.
-    """
-    cards = []
-    soup = BeautifulSoup(driver.page_source, "lxml")
-    bid_links = soup.find_all("a", class_="bid_no_hover")
-    status["log"].append(f"[GeM] BS4 fallback: {len(bid_links)} bid links found")
-
-    for link in bid_links:
-        try:
-            bid_no = link.get_text(strip=True)
-            if not re.search(r"GEM/\d{4}/", bid_no, re.I):
-                continue
-            bid_url = _make_bid_url(link.get("href", ""))
-
-            card_el = (
-                link.find_parent("div", class_="card") or
-                link.find_parent("div", class_=lambda c: c and "bid" in c.lower()) or
-                link.parent
-            )
-            card_text = card_el.get_text(separator=" ", strip=True) if card_el else bid_no
-            cards.append(_build_card(bid_no, bid_url, card_text, keyword))
-        except Exception:
-            continue
-    return cards
-
-
-# ── Pagination ─────────────────────────────────────────────────────────────────
+# ── Pagination (same as gem_bid_scraper_fast.py) ──────────────────────────────
 
 def _go_next_page(driver, current_page):
     try:
@@ -259,10 +264,11 @@ def _go_next_page(driver, current_page):
     return False
 
 
-# ── Per-keyword search ─────────────────────────────────────────────────────────
+# ── Search (same as gem_bid_scraper_fast.py) ──────────────────────────────────
 
 def _search_keyword(driver, keyword, max_pages, status):
-    cards = []
+    """Mirrors search_keyword() in gem_bid_scraper_fast.py exactly."""
+    bids = []
     status["log"].append(f"[GeM] Searching: '{keyword}'")
 
     try:
@@ -289,23 +295,16 @@ def _search_keyword(driver, keyword, max_pages, status):
                 EC.presence_of_element_located((By.CSS_SELECTOR, "a.bid_no_hover"))
             )
         except Exception:
-            status["log"].append(f"[GeM] '{keyword}': no results found on GeM")
-            return cards
+            status["log"].append(f"[GeM] '{keyword}': no results")
+            return bids
 
         for page in range(1, max_pages + 1):
             if not status.get("active"):
                 break
-
-            # Primary: use Selenium live DOM
-            page_cards = _extract_cards_selenium(driver, keyword, status)
-
-            # Fallback: parse page_source with BeautifulSoup
-            if not page_cards:
-                page_cards = _extract_cards_bs4(driver, keyword, status)
-
-            cards.extend(page_cards)
-            status["log"].append(f"[GeM] '{keyword}' page {page}: {len(page_cards)} cards extracted")
-
+            soup   = BeautifulSoup(driver.page_source, "lxml")
+            parsed = _parse_bid_cards(soup, keyword)
+            bids.extend(parsed)
+            status["log"].append(f"[GeM] '{keyword}' page {page}: {len(parsed)} bids")
             if page < max_pages:
                 if not _go_next_page(driver, page):
                     break
@@ -316,14 +315,17 @@ def _search_keyword(driver, keyword, max_pages, status):
     except Exception as e:
         status["log"].append(f"[GeM] Error on '{keyword}': {e}")
 
-    return cards
+    return bids
 
 
-# ── PDF fetching & parsing ─────────────────────────────────────────────────────
+# ── PDF (same as gem_bid_scraper_fast.py) ─────────────────────────────────────
 
 def _fetch_pdf_bytes(session, bid_url):
     try:
-        r = session.get(bid_url, timeout=PDF_TIMEOUT, stream=True)
+        r = session.get(bid_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": GEM_BASE,
+        }, timeout=PDF_TIMEOUT, stream=True)
         if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
             return r.content
     except Exception:
@@ -372,7 +374,7 @@ def _parse_pdf_fields(pdf_bytes):
                         return val
             except Exception:
                 continue
-        return ""
+        return "N/A"
 
     raw_value = get([
         r"/ Estimated Bid Value\s*\|\s*([\d,\.]+)",
@@ -380,80 +382,57 @@ def _parse_pdf_fields(pdf_bytes):
         r"Estimated Bid Value\s*\|\s*([\d,\.]+)",
     ])
     est_value = None
-    if raw_value:
+    if raw_value and raw_value != "N/A":
         try:
             est_value = float(raw_value.replace(",", ""))
         except ValueError:
             pass
 
     return {
-        "org_name":       get([r"/Organisation Name\s*\|\s*([^|]{5,120}?)\s*\|"]),
-        "department":     get([r"/Department Name\s*\|\s*([^|]{5,100}?)\s*\|"]),
-        "state":          get([r"/Ministry/State Name\s*\|\s*([^|]{3,80}?)\s*\|"]),
-        "item_category":  get([
+        "Organisation Name": get([r"/Organisation Name\s*\|\s*([^|]{5,120}?)\s*\|"]),
+        "Department":        get([r"/Department Name\s*\|\s*([^|]{5,100}?)\s*\|"]),
+        "State / Ministry":  get([r"/Ministry/State Name\s*\|\s*([^|]{3,80}?)\s*\|"]),
+        "Item Category":     get([
             r"/Item Category\s*\|\s*(.*?)\s*\|?\s*/Contract Period",
             r"/Item Category\s*\|\s*([^|]{10,300}?)\s*\|",
         ]),
-        "quantity":       get([
+        "Quantity": get([
             r"Total Quantity\s*\|\s*(\d[\d,]*)",
             r"(\d[\d,]*)\s*\|\s*N/A",
         ]),
         "estimated_value": est_value,
-        "bid_start_date": get([r"/Bid Start Date/Time\s*\|\s*(\d{2}-\d{2}-\d{4}[^|]{0,20}?)\s*\|"]),
-        "bid_end_date":   get([r"/Bid End Date/Time\s*\|\s*(\d{2}-\d{2}-\d{4}[^|]{0,20}?)\s*\|"]),
+        "Bid Start Date": get([
+            r"/Bid Start Date/Time\s*\|\s*(\d{2}-\d{2}-\d{4}[^|]{0,20}?)\s*\|",
+        ]),
+        "Bid End Date": get([
+            r"/Bid End Date/Time\s*\|\s*(\d{2}-\d{2}-\d{4}[^|]{0,20}?)\s*\|",
+        ]),
     }
 
 
-# ── Per-bid PDF enrichment ─────────────────────────────────────────────────────
+def _enrich_one(session, bid):
+    """Download + parse PDF for a single bid, then return DB-ready dict."""
+    bid_url = bid.get("Bid URL", "")
+    if not bid_url or bid_url == "N/A":
+        return bid
 
-def _enrich_one(session, card):
-    pdf_bytes = _fetch_pdf_bytes(session, card["bid_url"])
-    parsed    = _parse_pdf_fields(pdf_bytes)
+    pdf_bytes = _fetch_pdf_bytes(session, bid_url)
+    if not pdf_bytes:
+        return bid
 
-    item_cat = parsed.get("item_category") or card.get("item_category", "")
-    if item_cat and any(b.upper() in item_cat.upper() for b in BLOCKED_KEYWORDS):
-        return None
-
-    state_raw = parsed.get("state") or card.get("state_text", "")
-    region    = STATE_REGION_MAP.get(state_raw, "")
-
-    return {
-        "portal_id":       "gem",
-        "bid_number":      card["bid_number"],
-        "org_name":        parsed.get("org_name") or card.get("department", ""),
-        "department":      parsed.get("department") or card.get("department", ""),
-        "state":           state_raw,
-        "region":          region,
-        "item_category":   item_cat,
-        "quantity":        parsed.get("quantity") or card.get("quantity", ""),
-        "estimated_value": parsed.get("estimated_value"),
-        "bid_start_date":  parsed.get("bid_start_date") or card.get("start_date", ""),
-        "bid_end_date":    parsed.get("bid_end_date") or card.get("end_date", ""),
-        "keyword_used":    card["keyword_used"],
-        "bid_url":         card["bid_url"],
-    }
-
-
-# ── Card pre-filter ────────────────────────────────────────────────────────────
-
-def _card_prefilter(card, target_orgs):
-    if not target_orgs:
-        return True
-    state = (card.get("state_text") or "").upper()
-    dept  = (card.get("department") or "").upper()
-    combined = state + " " + dept
-    for t in target_orgs:
-        if t.upper() in combined:
-            return True
-    for kw in CARD_SECTOR_KEYWORDS:
-        if kw.upper() in combined:
-            return True
-    return False
+    pdf = _parse_pdf_fields(pdf_bytes)
+    DATE_FIELDS = {"Bid Start Date", "Bid End Date"}
+    for field, val in pdf.items():
+        if field in DATE_FIELDS:
+            continue
+        if val and val != "N/A":
+            bid[field] = val
+    return bid
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
 
-def run_gem_scrape(keywords, target_orgs, max_pages, status, db, headless=True):
+def run_gem_scrape(keywords, target_orgs, max_pages, status, db, headless=False):
     driver  = _make_driver(headless)
     session = requests.Session()
     session.headers.update({
@@ -461,11 +440,10 @@ def run_gem_scrape(keywords, target_orgs, max_pages, status, db, headless=True):
         "Referer":    GEM_BASE,
     })
 
-    total_saved    = 0
+    all_bids       = []
     total_keywords = len(keywords)
-    all_cards      = []
 
-    # Phase 1: browse GeM and collect bid cards for every keyword
+    # ── Phase 1: scrape bid cards for every keyword (mirrors gem_bid_scraper_fast main loop)
     try:
         kw_idx = 0
         while kw_idx < total_keywords:
@@ -478,8 +456,10 @@ def run_gem_scrape(keywords, target_orgs, max_pages, status, db, headless=True):
                 "progress":        int((kw_idx / total_keywords) * 80),
             })
             try:
-                cards = _search_keyword(driver, keyword, max_pages, status)
-                all_cards.extend(cards)
+                bids = _search_keyword(driver, keyword, max_pages, status)
+                all_bids.extend(bids)
+                if bids:
+                    status["log"].append(f"[GeM] '{keyword}': {len(bids)} bids collected")
                 kw_idx += 1
                 time.sleep(1)
             except RuntimeError:
@@ -495,53 +475,93 @@ def run_gem_scrape(keywords, target_orgs, max_pages, status, db, headless=True):
         except Exception:
             pass
 
-    # Phase 2: deduplicate within this run
+    # ── Phase 2: deduplicate
     seen, unique = set(), []
-    for c in all_cards:
-        bn = c["bid_number"]
+    for b in all_bids:
+        bn = b["Bid Number"]
         if bn not in seen:
             seen.add(bn)
-            unique.append(c)
-    status["log"].append(f"[GeM] {len(unique)} unique bid cards scraped across all keywords")
+            unique.append(b)
+    status["log"].append(f"[GeM] Step 1 — scraped & deduplicated: {len(unique)} bids")
 
-    # Phase 3: card pre-filter + DB duplicate check
-    candidates = []
-    for c in unique:
-        if not _card_prefilter(c, target_orgs):
-            continue
-        if db.bid_exists("gem", c["bid_number"]):
-            continue
-        candidates.append(c)
-    status["log"].append(f"[GeM] {len(candidates)} new candidates after pre-filter")
+    if not unique:
+        status["log"].append("[GeM] No bids found. Done.")
+        status["progress"] = 100
+        return 0
 
-    if not candidates:
+    # ── Phase 3: card pre-filter
+    pre_filtered = [b for b in unique if _card_prefilter(b, target_orgs)]
+    dropped = len(unique) - len(pre_filtered)
+    status["log"].append(
+        f"[GeM] Step 2 — card pre-filter: {len(pre_filtered)} kept / {dropped} dropped"
+    )
+
+    # ── Phase 4: skip bids already in DB
+    new_candidates = [b for b in pre_filtered if not db.bid_exists("gem", b["Bid Number"])]
+    status["log"].append(
+        f"[GeM] Step 3 — already in DB: {len(pre_filtered) - len(new_candidates)} skipped | "
+        f"{len(new_candidates)} new candidates"
+    )
+
+    if not new_candidates:
         status["log"].append("[GeM] Nothing new to add.")
         status["progress"] = 100
         return 0
 
-    # Phase 4: parallel PDF enrichment + save
+    # ── Phase 5: parallel PDF enrichment
     status["log"].append(
-        f"[GeM] Downloading PDFs for {len(candidates)} bids ({PARALLEL_PDF_WORKERS} parallel workers)..."
+        f"[GeM] Step 4 — downloading PDFs for {len(new_candidates)} bids "
+        f"({PARALLEL_PDF_WORKERS} parallel workers)..."
     )
     status["progress"] = 85
 
-    done_count = 0
+    results = [None] * len(new_candidates)
+    done    = [0]
     with ThreadPoolExecutor(max_workers=PARALLEL_PDF_WORKERS) as pool:
-        futures = {pool.submit(_enrich_one, session, c): c for c in candidates}
-        for fut in as_completed(futures):
-            done_count += 1
-            status["pdf_progress"] = int((done_count / len(candidates)) * 100)
-            bid = fut.result()
-            if bid is None:
-                continue
-            if target_orgs:
-                org = (bid.get("org_name") or "").upper()
-                if not any(t.upper() in org for t in target_orgs):
-                    continue
-            if db.add_bid(bid):
-                total_saved += 1
-                status["bids_found"] = total_saved
+        future_to_idx = {
+            pool.submit(_enrich_one, session, bid): i
+            for i, bid in enumerate(new_candidates)
+        }
+        for future in as_completed(future_to_idx):
+            idx          = future_to_idx[future]
+            results[idx] = future.result()
+            done[0]     += 1
+            status["pdf_progress"] = int(done[0] / len(new_candidates) * 100)
 
-    status["log"].append(f"[GeM] Complete. {total_saved} new bids saved.")
+    # ── Phase 6: final org filter + blocked category filter + save to DB
+    total_saved = 0
+    for bid in results:
+        if bid is None:
+            continue
+
+        if _is_blocked_category(bid.get("Item Category", "")):
+            continue
+
+        if target_orgs and not _is_target_org(bid.get("Organisation Name", ""), target_orgs):
+            continue
+
+        state_raw = bid.get("State / Ministry", "")
+        region    = STATE_REGION_MAP.get(state_raw, "")
+
+        db_bid = {
+            "portal_id":       "gem",
+            "bid_number":      bid["Bid Number"],
+            "org_name":        bid.get("Organisation Name", ""),
+            "department":      bid.get("Department", ""),
+            "state":           state_raw,
+            "region":          region,
+            "item_category":   bid.get("Item Category", ""),
+            "quantity":        bid.get("Quantity", ""),
+            "estimated_value": bid.get("estimated_value"),
+            "bid_start_date":  bid.get("Bid Start Date", ""),
+            "bid_end_date":    bid.get("Bid End Date", ""),
+            "keyword_used":    bid.get("Keyword Used", ""),
+            "bid_url":         bid.get("Bid URL", ""),
+        }
+        if db.add_bid(db_bid):
+            total_saved += 1
+            status["bids_found"] = total_saved
+
+    status["log"].append(f"[GeM] Complete. {total_saved} new bids saved to database.")
     status["progress"] = 100
     return total_saved
