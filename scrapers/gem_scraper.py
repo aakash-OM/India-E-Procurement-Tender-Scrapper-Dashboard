@@ -504,7 +504,15 @@ def run_gem_scrape(keywords, target_orgs, max_pages, status, db, headless=False)
     )
 
     if not new_candidates:
-        status["log"].append("[GeM] Nothing new to add.")
+        try:
+            with db._conn() as conn:
+                total_in_db = conn.execute("SELECT COUNT(*) FROM bids").fetchone()[0]
+        except Exception:
+            total_in_db = "?"
+        status["log"].append(
+            f"[GeM] All bids already in database ({total_in_db} total). "
+            f"Check the Results tab to view them."
+        )
         status["progress"] = 100
         return 0
 

@@ -585,17 +585,24 @@ async function pollStatus() {
   if (span) span.textContent = data.active ? `Scraping: ${data.bids_found || 0} found` : 'Idle';
 
   const prog = document.getElementById('progress-block');
-  if (prog) prog.classList.toggle('visible', data.active);
+  if (prog) prog.classList.add('visible'); // always keep visible once search has run
 
   if (!data.active) {
     clearInterval(state.polling);
     state.polling = null;
     updateScrapeUI(false);
     const progText = document.getElementById('prog-text');
-    if (progText) progText.textContent = 'Ready — press START SEARCH to begin fetching from GeM';
-    if (data.bids_found > 0) showToast(`Done! ${data.bids_found} new bids saved.`, 'success');
+    if (progText) progText.textContent = 'Search complete — see Results tab for saved bids';
+    if (data.bids_found > 0) {
+      showToast(`Done! ${data.bids_found} new bids saved.`, 'success');
+    } else if (data.log && data.log.length > 0) {
+      // Show completion even when 0 new bids (likely all already in DB)
+      const lastLine = data.log[data.log.length - 1] || '';
+      showToast(lastLine.replace('[GeM] ', ''), 'info');
+    }
     loadStats();
     loadResults();
+    showSection('results'); // auto-navigate to Results tab
   }
 }
 
